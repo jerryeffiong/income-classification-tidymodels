@@ -1,0 +1,744 @@
+---
+title: "Adult"
+format: html
+editor: visual
+---
+
+
+
+## Quarto
+
+Quarto enables you to weave together content and executable code into a finished document. To learn more about Quarto see <https://quarto.org>.
+
+## Running Code
+
+When you click the **Render** button a document will be generated that includes both content and the output of embedded code. You can embed code like this:
+
+
+
+```{r}
+if (!requireNamespace("xfun", quietly = TRUE)) {
+install.packages("xfun")
+}
+if (!requireNamespace("mlr", quietly = TRUE)) {
+install.packages("mlr")
+}
+if (!requireNamespace("GGally", quietly = TRUE)) {
+install.packages("GGally")
+}
+
+library(readr)
+library(skimr)
+library(janitor)
+library(dplyr)
+library(tidyr)
+library(tidyverse)    
+library(recipes)      
+library(rsample)    
+library(yardstick)  
+library(vip)
+library(knitr) 
+library(hardhat)   
+library(themis)
+library(tune)
+library(parsnip)
+library(workflows)
+library(parallel)
+library(doParallel)
+library(tidymodels)
+library(knitr)
+library(pdp)
+library(lime)
+library(ggplot2)
+library(tibble)
+library(scales)
+library(forcats)
+
+```
+
+```{r}
+csv_path <- "adult.csv" 
+
+adult_df <- read_csv(csv_path, show_col_types = FALSE)
+
+cat("Dimensions of adult_df (rows, columns):\n")
+print(dim(adult_df))
+
+skim(adult_df)
+
+cat("\nIncome class distribution:\n")
+adult_df %>%
+  count(income) %>%                     
+  mutate(proportion = n / sum(n)) %>%   
+  kable(digits = 3, 
+        col.names = c("Income", "Count", "Proportion"))
+
+cat("\nFirst 6 rows of the dataset:\n")
+print(head(adult_df, 6))
+
+cat("\nCounts of '?' entries in character columns:\n")
+adult_df %>%
+  summarize(across(where(is.character), ~ sum(. == "?", na.rm = TRUE))) %>%
+  pivot_longer(everything(), names_to = "column", values_to = "count_question") %>%
+  arrange(desc(count_question)) %>%
+  kable(col.names = c("Column", "Count of '?'"))
+
+adult_clean <- adult_df %>%
+  mutate(across(
+    .cols = where(is.character),
+    .fns  = ~ na_if(., "?")                  
+  )) %>%
+  mutate(across(
+    .cols = where(is.character),
+    .fns  = ~ replace_na(., "Unknown")       
+  ))
+
+cat("\nCounts of 'Unknown' after recoding:\n")
+adult_clean %>%
+  summarize(across(where(is.character), ~ sum(. == "Unknown", na.rm = TRUE))) %>%
+  pivot_longer(everything(), names_to = "column", values_to = "count_unknown") %>%
+  arrange(desc(count_unknown)) %>%
+  kable(col.names = c("Column", "Count of 'Unknown'"))
+```
+
+```{r}
+clr_low  <- "#3182BD"  
+clr_high <- "#FFD54F" 
+
+ggplot(adult_clean, aes(x = income, fill = income)) +
+  geom_bar() +
+  geom_text(
+    stat  = "count",
+    aes(label = comma(after_stat(count))),
+    vjust = -0.30, size = 5, colour = "white"
+  ) +
+  scale_fill_manual(
+    values = c("<=50K" = clr_low,
+               ">50K"  = clr_high),
+    guide  = "none"               # hide legend (optional)
+  ) +
+  labs(
+    title = "Class Distribution in Adult Census Income Data",
+    x     = "Income Class",
+    y     = "Count of Individuals"
+  ) +
+  theme_minimal(base_size = 14)
+
+ggsave("class_distribution.png", width = 6, height = 4, dpi = 300)
+```
+
+```{r}
+feat_type_vec <- sapply(adult_clean %>% select(-income), is.numeric)
+type_tbl <- tibble(
+  feature   = names(feat_type_vec),
+  feat_type = ifelse(feat_type_vec, "Numeric", "Categorical")
+)
+
+known_counts <- adult_clean %>% 
+  select(-income) %>% 
+  summarise(across(
+    everything(),
+    ~ if (is.numeric(.x)) {
+        sum(!is.na(.x))                      
+      } else {
+        sum(as.character(.x) != "Unknown")  
+      }
+  )) %>% 
+  pivot_longer(everything(),
+               names_to  = "feature",
+               values_to = "n_known") %>% 
+  left_join(type_tbl, by = "feature") %>%    # add type label
+  mutate(feature = fct_reorder(feature, n_known))
+
+ggplot(known_counts,
+       aes(x = feature, y = n_known, fill = feat_type)) +
+  geom_col(width = 0.7) +
+  labs(title    = "How Complete Is Each Feature?",
+       subtitle = "Count of observations with a *known* value",
+       x        = NULL,
+       y        = "Number of Known Rows",
+       fill     = "Feature Type") +
+  scale_fill_manual(values = c("Numeric"     = "#FF6FA8",
+                               "Categorical" = "#FFD54F")) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.background      = element_rect(fill = "white", colour = NA),
+    panel.grid.major.x   = element_blank(),
+    panel.grid.minor     = element_blank(),
+    axis.text.x          = element_text(angle = 45, hjust = 1, vjust = 1),
+    axis.title.y         = element_text(margin = margin(r = 10)),
+    plot.title           = element_text(face = "bold", size = 16),
+    plot.subtitle        = element_text(size = 12, margin = margin(b = 8))
+  ) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.05)))
+
+ggsave("known_values_by_feature_type.png",
+       width = 8, height = 5, dpi = 400)
+```
+
+```{r}
+edu_income <- adult_clean %>%                             
+  mutate(high_income = income == ">50K") %>%              
+  group_by(education) %>%                                
+  summarise(share_gt50k = mean(high_income),              
+            n           = n()) %>%                        
+  arrange(desc(share_gt50k))                              
+
+ggplot(edu_income, aes(x = reorder(education, share_gt50k),
+                       y = share_gt50k)) +
+  geom_col(fill = "#2171b5") +                            
+  coord_flip() +                                          
+  scale_y_continuous(labels = percent_format()) +
+  labs(title   = "Share of >$50K Earners by Education Level",
+       x       = "Education Level",
+       y       = "% of Group Earning >$50K") +
+  theme_minimal(base_size = 14)
+
+ggsave("education_income_share.png",
+       width = 8, height = 5, dpi = 300)
+
+```
+
+```{r}
+col_low  <- "#3182BD"  
+col_high <- "#FF6FA8"  
+
+ggplot(adult_clean, aes(x = age, fill = income, colour = income)) +
+  geom_density(alpha = 0.35, adjust = 1.25) +          
+  scale_fill_manual(values  = c("<=50K" = col_low,
+                                ">50K"  = col_high)) +
+  scale_color_manual(values = c("<=50K" = col_low,
+                                ">50K"  = col_high)) +
+  scale_x_continuous(breaks = seq(15, 90, 15)) +
+  labs(title = "Age Distribution by Income Class",
+       x     = "Age (years)",
+       y     = "Density",
+       fill  = "Income",
+       colour = "Income") +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.background    = element_rect(fill = "white", colour = NA),
+    legend.position    = "top"
+  )
+
+ggsave("age_density_by_income.png", width = 7, height = 5, dpi = 300)
+```
+
+```{r}
+col_low  <- "#3182BD"  
+col_high <- "#FFD54F"   
+
+ggplot(adult_clean,
+       aes(x = factor(`educational-num`), fill = income)) +
+  geom_bar(position = position_dodge(width = 0.8), width = 0.7) +
+  scale_fill_manual(values = c("<=50K" = col_low,
+                               ">50K"  = col_high)) +
+  labs(title = "Counts by Education‑Num and Income Class",
+       x     = "Education‑Num (1 = Preschool … 16 = Doctorate)",
+       y     = "Number of Individuals",
+       fill  = "Income") +
+  theme_minimal(base_size = 14) +
+  theme(plot.background = element_rect(fill = "white", colour = NA),
+        legend.position = "top")
+
+ggsave("education_num_counts_by_income.png",
+       width = 8, height = 4.5, dpi = 300)
+
+
+```
+
+```{r}
+col_low  <- "#3182BD"   
+col_high <- "#FF6FA8"   
+
+plot_density_by_class <- function(df, column, x_breaks = waiver(), x_label = NULL) {
+  ggplot(df, aes(x = .data[[column]], fill = income, colour = income)) +
+    geom_density(alpha = 0.35, adjust = 1.25) +
+    scale_fill_manual(values  = c("<=50K" = col_low, ">50K" = col_high)) +
+    scale_color_manual(values = c("<=50K" = col_low, ">50K" = col_high)) +
+    scale_x_continuous(breaks = x_breaks, labels = comma_format()) +
+    labs(title  = paste(column, "Distribution by Income Class"),
+         x      = x_label %||% column,
+         y      = "Density",
+         fill   = "Income", colour = "Income") +
+    theme_minimal(base_size = 14) +
+    theme(plot.background = element_rect(fill = "white", colour = NA),
+          legend.position = "top")
+}
+
+plot_density_by_class(adult_clean,
+                      column   = "fnlwgt",
+                      x_breaks = scales::pretty_breaks(n = 6),
+                      x_label  = "fnlwgt (sampling weight)")
+
+ggsave("fnlwgt_density_by_income.png", width = 7, height = 4, dpi = 300)
+
+plot_density_by_class(adult_clean,
+                      column   = "capital-gain",
+                      x_breaks = scales::pretty_breaks(n = 6),
+                      x_label  = "Capital Gain (US$)")
+
+ggsave("capital_gain_density_by_income.png", width = 7, height = 4, dpi = 300)
+
+plot_density_by_class(adult_clean,
+                      column   = "capital-loss",
+                      x_breaks = scales::pretty_breaks(n = 6),
+                      x_label  = "Capital Loss (US$)")
+
+ggsave("capital_loss_density_by_income.png", width = 7, height = 4, dpi = 300)
+
+plot_density_by_class(adult_clean,
+                      column   = "hours-per-week",
+                      x_breaks = seq(0, 100, 20),
+                      x_label  = "Hours Worked per Week")
+
+ggsave("hours_per_week_density_by_income.png", width = 7, height = 4, dpi = 300)
+
+```
+
+```{r}
+rec_encode <- recipe(income ~ ., data = adult_clean) %>%
+  
+  step_other(all_nominal_predictors(), threshold = 0.01, other = "Other") %>%
+  
+  step_string2factor(all_nominal_predictors()) %>%
+  
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) %>%
+  
+  step_zv(all_predictors())
+
+rec_encode_p <- prep(rec_encode)
+df_encoded  <- bake(rec_encode_p, new_data = NULL)
+
+cat("Encoded data dimensions (rows, columns):\n")
+print(dim(df_encoded))
+
+cat("\nPreview first 6 rows (first 10 columns):\n")
+print(head(df_encoded[, 1:10]))
+```
+
+```{r}
+rec_final <- rec_encode %>%
+  step_normalize(all_numeric_predictors())
+
+rec_final_p <- prep(rec_final)
+df_final   <- bake(rec_final_p, new_data = NULL)
+
+cat("Final processed data dimensions (rows, columns):\n")
+print(dim(df_final))
+
+set.seed(123)
+split_obj  <- initial_split(df_final, prop = 0.8, strata = "income")
+train_data  <- training(split_obj)
+test_data   <- testing(split_obj)
+
+train_data <- train_data %>%
+  mutate(income = factor(income, levels = c("<=50K", ">50K")))
+test_data  <- test_data  %>%
+  mutate(income = factor(income, levels = c("<=50K", ">50K")))
+
+
+
+cat("\nTraining set dimensions:\n")
+print(dim(train_data))
+cat("Training set class distribution:\n")
+train_data %>% 
+  count(income) %>% 
+  mutate(freq = n / sum(n)) %>% 
+  print()
+
+cat("\nTest set dimensions:\n")
+print(dim(test_data))
+cat("Test set class distribution:\n")
+test_data %>% 
+  count(income) %>% 
+  mutate(freq = n / sum(n)) %>% 
+  print()
+
+train_data %>% count(income) %>%  
+  print()
+```
+
+```{r}
+rec_final2 <- recipe(income ~ ., data = train_data) %>%
+  step_other(all_nominal_predictors(), threshold = 0.01, other = "Other") %>%
+  step_string2factor(all_nominal_predictors()) %>%
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) %>%
+  step_corr(all_numeric_predictors(), threshold = 0.90) %>%   
+  step_nzv(all_predictors()) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_smote(   income, over_ratio = 1.5, neighbors = 5) %>%   
+  step_downsample(income, under_ratio = 1)   
+
+set.seed(234)
+cv_splits2 <- vfold_cv(train_data, v = 5, strata = "income")
+
+log_spec2 <- logistic_reg(
+  mode    = "classification",
+  penalty = tune(),
+  mixture = tune()
+) %>% 
+  set_engine("glmnet")
+
+wf_log2 <- workflow() %>%
+  add_recipe(rec_final2) %>%
+  add_model(log_spec2)
+
+log_grid2 <- grid_regular(
+  penalty(range = c(-4, 0), trans = log10_trans()),
+  mixture(range = c(0, 1)),
+  levels = c(penalty = 10, mixture = 5)
+)
+
+set.seed(345)
+log_res2 <- tune_grid(
+  wf_log2,
+  resamples = cv_splits2,
+  grid      = log_grid2,
+  metrics   = metric_set(roc_auc, accuracy)
+)
+
+show_notes(log_res2)
+log_res2 %>%
+  collect_metrics() %>%
+  filter(.metric %in% c("roc_auc","accuracy")) %>%
+  pivot_wider(names_from = .metric, values_from = mean) %>%
+  arrange(desc(roc_auc)) %>%
+  head(5)
+
+show_best(log_res2, metric = "roc_auc", n = 3)
+
+best_params <- select_best(log_res2, metric = "roc_auc")
+
+final_log_wf <- finalize_workflow(
+  wf_log2,
+  best_params
+)
+
+final_log_fit <- last_fit(
+  final_log_wf,
+  split = split_obj     
+)
+
+final_log_fit %>% collect_metrics()
+
+final_preds <- final_log_fit %>% collect_predictions()
+
+final_preds %>% conf_mat(truth = income, estimate = .pred_class)
+
+final_preds %>% roc_auc(truth = income, `.pred_>50K`, event_level = "second")
+
+
+```
+
+```{r}
+num_preds <- rec_final2 %>% 
+  prep() %>% 
+  juice() %>% 
+  select(-income) %>% 
+  ncol()
+
+rf_grid_small <- expand_grid(
+  mtry = floor(c(num_preds/4,
+                 num_preds/2,
+                 3*num_preds/4)),
+  min_n = c(5, 10, 20)
+)
+
+svm_grid_small <- expand_grid(
+  cost      = c(0.01, 1, 10),
+  rbf_sigma = c(0.001, 0.01, 0.1)
+)
+
+svm_spec_small <- svm_rbf(
+  mode      = "classification",
+  cost      = tune(),
+  rbf_sigma = tune()
+) %>% set_engine("kernlab", prob.model = TRUE)
+
+svm_wf_small <- workflow() %>%
+  add_recipe(rec_final2) %>%
+  add_model(svm_spec_small) 
+
+
+n_workers <- parallel::detectCores() - 1
+cl <- makeCluster(n_workers); registerDoParallel(cl)
+
+ctrl <- control_grid(
+  save_workflow = TRUE,
+  allow_par     = TRUE,               
+  parallel_over = "resamples"         
+)
+
+set.seed(456)
+svm_res_small <- tune_grid(
+  svm_wf_small,                              
+  resamples       = vfold_cv(train_data, 3, strata = "income"),
+  grid            = svm_grid_small,
+  metrics         = metric_set(roc_auc, accuracy),
+  control   = ctrl
+)
+
+
+
+svm_res_small %>%
+  collect_metrics() %>%
+  filter(.metric == "roc_auc") %>%
+  arrange(desc(mean))
+
+rf_grid_small <- expand_grid(
+  mtry  = floor(c(num_preds/4, num_preds/2, 3*num_preds/4)),
+  min_n = c(5, 10, 20)
+)
+
+set.seed(567)
+rf_res_small <- tune_grid(
+  workflow() %>%
+    add_recipe(rec_final2) %>%
+    add_model(
+      rand_forest(mode="classification",
+                  trees = 500,
+                  mtry  = tune(),
+                  min_n = tune()) %>%
+        set_engine("ranger", importance="impurity", num.threads=4)
+    ),
+  resamples = vfold_cv(train_data, v = 3, strata = "income"),
+  grid      = rf_grid_small,
+  metrics   = metric_set(roc_auc, accuracy),
+  control   = ctrl
+)
+
+rf_res_small %>%
+  collect_metrics() %>%
+  filter(.metric == "roc_auc") %>%
+  arrange(desc(mean))
+
+stopCluster(cl)
+registerDoSEQ() 
+```
+
+```{r}
+rf_spec_small <- rand_forest(
+  mode  = "classification",
+  trees = 500,
+  mtry  = tune(),
+  min_n = tune()
+) %>% set_engine("ranger", importance = "impurity", num.threads = 4)
+
+rf_wf_small  <- workflow() %>%
+  add_recipe(rec_final2) %>%
+  add_model(rf_spec_small)
+
+best_svm_params <- select_best(svm_res_small, metric = "roc_auc")
+best_rf_params  <- select_best(rf_res_small,  metric = "roc_auc")
+
+final_svm_wf <- finalize_workflow(svm_wf_small, best_svm_params)
+final_rf_wf  <- finalize_workflow(rf_wf_small,  best_rf_params)
+
+final_svm_res <- last_fit(final_svm_wf, split = split_obj)
+final_rf_res  <- last_fit(final_rf_wf,  split = split_obj)
+
+svm_metrics <- final_svm_res %>% collect_metrics() %>% mutate(model = "SVM_small")
+rf_metrics  <- final_rf_res  %>% collect_metrics() %>% mutate(model = "RF_small")
+
+bind_rows(svm_metrics, rf_metrics) %>%
+  select(model, .metric, .estimate)
+
+svm_preds <- final_svm_res %>% collect_predictions()
+rf_preds  <- final_rf_res  %>% collect_predictions()
+
+svm_preds %>% conf_mat(truth = income, estimate = .pred_class)
+svm_preds %>% roc_auc(truth = income, `.pred_>50K`, event_level = "second")
+
+rf_preds %>% conf_mat(truth = income, estimate = .pred_class)
+rf_preds %>% roc_auc(truth = income, `.pred_>50K`, event_level = "second")
+```
+
+```{r}
+final_svm_res %>% collect_metrics()
+
+log_metrics <- final_log_fit %>%
+  collect_metrics() %>%
+  filter(.metric %in% c("accuracy", "roc_auc")) %>%
+  mutate(model = "Logistic") %>%
+  select(model, .metric, .estimate)
+
+svm_metrics <- final_svm_res %>%
+  collect_metrics() %>%
+  filter(.metric %in% c("accuracy", "roc_auc")) %>%
+  mutate(model = "SVM_small") %>%
+  select(model, .metric, .estimate)
+
+rf_metrics  <- final_rf_res %>%
+  collect_metrics() %>%
+  filter(.metric %in% c("accuracy", "roc_auc")) %>%
+  mutate(model = "RF_small") %>%
+  select(model, .metric, .estimate)
+
+log_metrics
+svm_metrics
+rf_metrics
+
+
+comparison_all <- bind_rows(log_metrics, svm_metrics, rf_metrics) %>%
+  pivot_wider(names_from = .metric, values_from = .estimate) %>%
+   rename(Model    = model,
+         Accuracy = accuracy,
+         `ROC AUC`= roc_auc) %>%
+  mutate(across(c(Accuracy, `ROC AUC`), ~ round(.x, 3)))  
+
+comparison_all %>%
+  kable(
+    caption   = "Final Model Comparison on Test Set",
+    align     = c("l","c","c")
+  )
+```
+
+```{r}
+bind_rows(
+  final_log_fit %>% collect_predictions() %>% mutate(Model="Logistic"),
+  final_svm_res %>% collect_predictions() %>% mutate(Model="SVM"),
+  final_rf_res  %>% collect_predictions() %>% mutate(Model="RF")) %>%
+  roc_curve(truth=income, `.pred_>50K`) %>%
+  autoplot()
+
+```
+
+```{r}
+trained_wf <- final_rf_res %>% pull(.workflow) %>% pluck(1)
+
+rf_engine <- extract_fit_parsnip(trained_wf)$fit
+
+vip(rf_engine, num_features = 20) +
+  labs(title = "Variable Importance – Random Forest")
+
+rec_p      <- prep(rec_final2)                    
+train_baked <- bake(rec_p, new_data = train_data)  
+
+
+removed_by_corr <- rec_p$steps[[4]]$removals
+cat("Removed by step_corr():\n")
+print(removed_by_corr)
+
+
+
+pdp_age <- partial(
+  object     = rf_engine,
+  pred.var   = "age",
+  train      = train_baked,
+  type       = "classification",       
+  prob = TRUE,
+  which.class= ">50K"       
+)
+
+autoplot(pdp_age) +
+  labs(
+    title = "PDP: Probability(>50K) vs. Age",
+    x     = "Age (standardized)",
+    y     = "Predicted Prob (>50K)"
+  ) +
+  theme_minimal()
+
+
+explainer <- lime(
+  x              = train_data %>% select(-income),
+  model          = rf_engine,
+  preprocess     = function(df) bake(rec_p, new_data = df),
+  bin_continuous = FALSE
+)
+
+
+new_obs <- test_data %>% 
+  slice(1:5) %>% 
+  select(-income)
+
+explanation <- explain(
+  new_obs,
+  explainer,
+  n_labels   = 1,
+  n_features = 5
+)
+plot_features(explanation) +
+  ggtitle("LIME Explanations – RF for 5 Test Observations")
+
+```
+
+```{r}
+trained_log_wf <- final_log_fit %>% pull(.workflow) %>% pluck(1)
+
+log_engine <- extract_fit_parsnip(trained_log_wf)$fit
+
+best_lambda <- log_engine$spec$args$penalty
+
+raw_coefs <- coef(log_engine$fit, s = best_lambda)
+
+trained_log_wf <- final_log_fit %>% 
+  pull(.workflow) %>% 
+  pluck(1)
+
+model_fit  <- extract_fit_parsnip(trained_log_wf)
+glmnet_obj <- model_fit$fit
+
+best_lambda <- model_fit$spec$args$penalty
+
+coef_mat <- as.matrix(coef(glmnet_obj, s = best_lambda))
+
+coefs_df <- tibble(
+  term     = rownames(coef_mat),
+  estimate = coef_mat[, 1]
+) %>%
+  filter(estimate != 0) %>%
+  arrange(desc(abs(estimate)))
+
+cat("Non‐zero logistic coefficients (λ =", best_lambda, "):\n")
+print(coefs_df)
+
+
+top20_df <- coefs_df %>%
+  mutate(abs_est = abs(estimate)) %>%
+  arrange(desc(abs_est)) %>%
+  slice(1:20)
+
+ggplot(top20_df, aes(x = reorder(term, abs_est), y = abs_est)) +
+  geom_col(fill = "#FFD54F") +
+  coord_flip() +
+  labs(
+    title = paste0("Top 20 Logistic Coefficients by Absolute Value (λ = ", best_lambda, ")"),
+    x = "Variable",
+    y = "Absolute Coefficient"
+  ) +
+  theme_minimal()
+
+```
+
+```{r}
+
+trained_svm_wf <- final_svm_res %>% pull(.workflow) %>% pluck(1)
+svm_engine     <- extract_fit_parsnip(trained_svm_wf)$fit  
+
+svm_pred <- function(object, newdata) {
+  
+  predict(object, newdata, type = "prob")[,2]
+}
+n_workers <- parallel::detectCores() - 1   
+cl        <- makeCluster(n_workers)
+registerDoParallel(cl)
+
+set.seed(123)  
+
+vip(
+  svm_engine,                
+  method       = "permute",  
+  train        = train_data, 
+  target       = "income",   
+  metric       = "roc_auc",  
+  event_level  = "second",
+  pred_wrapper = svm_pred,   
+  nsim         = 5          
+) +
+  labs(title = "Permutation Importance – SVM (RBF)")
+
+stopCluster(cl)
+
+```
+
